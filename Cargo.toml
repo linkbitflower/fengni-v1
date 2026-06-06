@@ -1,0 +1,27 @@
+[package]
+name = "fengni"
+version = "0.1.0"
+edition = "2021"
+description = "A private encrypted communication protocol library"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/linkbitflower/fengni-v1"
+readme = "README.md"
+keywords = ["cryptography", "protocol", "encryption", "x25519", "chacha20"]
+categories = ["cryptography", "network-programming"]
+
+[dependencies]
+# Cryptography
+x25519-dalek = { version = "2", features = ["static_secrets", "getrandom"] }
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+
+# Serialization
+prost = "0.13"
+bytes = "1"
+
+# Error handling
+thiserror = "2"
+
+[dev-dependencies]
+hex = "0.4"

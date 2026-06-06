@@ -1,0 +1,72 @@
+syntax = "proto3";
+
+package fengni.v1;
+
+// --- Handshake Messages ---
+
+// Hello is the first message in a handshake, sent by the initiator.
+// It contains an ephemeral public key and a timestamp for replay protection.
+message Hello {
+  // Ephemeral X25519 public key (32 bytes).
+  bytes ephemeral_public = 1;
+
+  // Unix timestamp in seconds, used to detect expired/replayed messages.
+  uint64 timestamp = 2;
+}
+
+// HelloReply is the response to Hello, sent by the responder.
+// It contains the responder's ephemeral public key and an encrypted
+// session token that proves the responder's identity.
+message HelloReply {
+  // Responder's ephemeral X25519 public key (32 bytes).
+  bytes ephemeral_public = 1;
+
+  // Session token, encrypted under the handshake key.
+  // Plaintext: [responder_identity_public (32)] [session_id (8)].
+  bytes session_token = 2;
+}
+
+// Authenticate is sent by the initiator after receiving HelloReply.
+// It proves the initiator's identity to the responder.
+message Authenticate {
+  // Initiator's long-term X25519 public key (32 bytes).
+  bytes identity_public = 1;
+
+  // MAC proof of identity possession under the handshake key.
+  // Plaintext: [identity_public (32)] [context_label].
+  bytes proof = 2;
+}
+
+// ServerFinish is the final handshake message, sent by the responder.
+// It confirms the handshake completed successfully.
+message ServerFinish {
+  // Confirmation payload encrypted under the session key.
+  // Plaintext: "fengni-handshake-complete" (fixed constant).
+  bytes payload = 1;
+}
+
+// --- Data Messages ---
+
+// DataPacket carries encrypted application data after the handshake
+// has completed and a session key is established.
+message DataPacket {
+  // Monotonically increasing sequence number for replay protection.
+  uint64 sequence = 1;
+
+  // Encrypted application payload (ChaCha20-Poly1305, session key).
+  bytes ciphertext = 2;
+}
+
+// --- Top-Level Wrapper ---
+
+// FengniMessage is the top-level protocol message. Every message
+// on the wire is encoded as a FengniMessage with exactly one variant.
+message FengniMessage {
+  oneof variant {
+    Hello hello = 1;
+    HelloReply hello_reply = 2;
+    Authenticate authenticate = 3;
+    ServerFinish server_finish = 4;
+    DataPacket data_packet = 5;
+  }
+}
