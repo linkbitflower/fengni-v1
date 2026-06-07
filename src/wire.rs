@@ -91,7 +91,6 @@ pub mod fengni_message {
 // --- Encode / Decode ---
 
 use prost::Message;
-use bytes::BufMut;
 
 /// Encode a FengniMessage to protobuf bytes.
 pub fn encode(msg: &FengniMessage) -> Result<Vec<u8>, prost::EncodeError> {

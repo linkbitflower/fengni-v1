@@ -19,7 +19,7 @@
 
 use crate::error::CryptoError;
 use chacha20poly1305::{
-    aead::{Aead, AeadInPlace, KeyInit, OsRng},
+    aead::{Aead, KeyInit, OsRng},
     ChaCha20Poly1305, Nonce,
 };
 use hkdf::Hkdf;
@@ -194,46 +194,32 @@ pub fn encrypt_into(
     plaintext: &[u8],
     out: &mut [u8],
 ) -> Result<usize, CryptoError> {
-    let expected = plaintext.len() + TAG_LEN;
-    if out.len() < expected {
+    let ct = encrypt(key, nonce, plaintext)?;
+    let len = ct.len();
+    if out.len() < len {
         return Err(CryptoError::Encrypt);
     }
-    out[..plaintext.len()].copy_from_slice(plaintext);
-    let cipher = ChaCha20Poly1305::new_from_slice(key).map_err(|_| CryptoError::Encrypt)?;
-    let nonce = Nonce::from_slice(nonce);
-    let tag = cipher
-        .encrypt_in_place_detached(nonce, b"", &mut out[..plaintext.len()])
-        .map_err(|_| CryptoError::Encrypt)?;
-    out[plaintext.len()..expected].copy_from_slice(&tag);
-    Ok(expected)
+    out[..len].copy_from_slice(&ct);
+    Ok(len)
 }
 
-/// Decrypt `ciphertext` into a caller-provided buffer (zero-copy).
+/// Decrypt `ciphertext` into a caller-provided buffer.
 ///
 /// Writes plaintext into `out`. Returns bytes written.
 /// Requires `out.len() >= ciphertext.len() - TAG_LEN`.
-/// Uses `decrypt_in_place_detached` to avoid internal allocation.
 pub fn decrypt_into(
     key: &[u8; SYMMETRIC_KEY_LEN],
     nonce: &[u8; NONCE_LEN],
     ciphertext: &[u8],
     out: &mut [u8],
 ) -> Result<usize, CryptoError> {
-    if ciphertext.len() < TAG_LEN {
+    let pt = decrypt(key, nonce, ciphertext)?;
+    let len = pt.len();
+    if out.len() < len {
         return Err(CryptoError::Decrypt);
     }
-    let pt_len = ciphertext.len() - TAG_LEN;
-    if out.len() < pt_len {
-        return Err(CryptoError::Decrypt);
-    }
-    out[..ciphertext.len()].copy_from_slice(ciphertext);
-    let cipher = ChaCha20Poly1305::new_from_slice(key).map_err(|_| CryptoError::Decrypt)?;
-    let nonce = Nonce::from_slice(nonce);
-    let tag = chacha20poly1305::aead::Tag::<ChaCha20Poly1305>::from_slice(&ciphertext[pt_len..]);
-    cipher
-        .decrypt_in_place_detached(nonce, b"", &mut out[..pt_len], tag)
-        .map_err(|_| CryptoError::Decrypt)?;
-    Ok(pt_len)
+    out[..len].copy_from_slice(&pt);
+    Ok(len)
 }
 
 // --- CipherState ---
