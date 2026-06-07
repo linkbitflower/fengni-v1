@@ -41,6 +41,9 @@ const HKDF_INFO_RECV: &[u8] = b"fengni-v1-transport-recv";
 /// Context label for HMAC proof in Authentication.
 const PROOF_CONTEXT: &[u8] = b"fengni-v1-auth-proof";
 
+/// HKDF info label for identity encryption in Authenticate message.
+const HKDF_INFO_IDENTITY_HIDE: &[u8] = b"fengni-v1-auth-identity";
+
 /// Maximum allowed clock skew in seconds.
 const CLOCK_SKEW_SECS: u64 = 60;
 
@@ -48,24 +51,39 @@ const CLOCK_SKEW_SECS: u64 = 60;
 // --- Handshake State ---
 
 /// The state of a handshake.
+///
+/// Each variant carries only the data relevant to that phase.
+/// No `Option<>` fields — the type system guarantees data is present
+/// when the state matches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HandshakeState {
     /// Waiting for the initiator's Hello.
     ExpectHello,
     /// Waiting for the responder's HelloReply.
-    ExpectHelloReply,
+    /// Carries the pinned peer static public key for identity verification.
+    ExpectHelloReply {
+        peer_static_public: [u8; PUBLIC_KEY_LEN],
+    },
     /// Waiting for the initiator's Authenticate.
-    ExpectAuthenticate,
+    ExpectAuthenticate {
+        peer_ephemeral_public: [u8; PUBLIC_KEY_LEN],
+    },
     /// Waiting for the responder's ServerFinish.
-    ExpectServerFinish,
+    ExpectServerFinish {
+        peer_ephemeral_public: [u8; PUBLIC_KEY_LEN],
+        peer_identity_public: [u8; PUBLIC_KEY_LEN],
+    },
     /// Handshake is complete; send/recv keys are established.
-    Completed,
+    Completed {
+        send_key: [u8; SYMMETRIC_KEY_LEN],
+        recv_key: [u8; SYMMETRIC_KEY_LEN],
+    },
 }
 
 impl HandshakeState {
     /// Returns true if the handshake has completed.
     pub fn is_completed(&self) -> bool {
-        matches!(self, Self::Completed)
+        matches!(self, Self::Completed { .. })
     }
 }
 
@@ -105,18 +123,19 @@ impl HandshakeBuilder {
 
     /// Build the handshake state machine.
     pub fn build(self) -> Handshake {
+        let state = if self.is_initiator {
+            HandshakeState::ExpectHelloReply {
+                peer_static_public: self
+                    .peer_static_public
+                    .expect("initiator requires peer_static_public"),
+            }
+        } else {
+            HandshakeState::ExpectHello
+        };
         Handshake {
-            state: if self.is_initiator {
-                HandshakeState::ExpectHelloReply
-            } else {
-                HandshakeState::ExpectHello
-            },
+            state,
             identity: self.identity,
             ephemeral: KeyPair::generate(),
-            peer_identity_public: self.peer_static_public,
-            peer_ephemeral_public: None,
-            send_key: None,
-            recv_key: None,
         }
     }
 }
@@ -128,10 +147,6 @@ pub struct Handshake {
     state: HandshakeState,
     identity: KeyPair,
     ephemeral: KeyPair,
-    peer_identity_public: Option<[u8; PUBLIC_KEY_LEN]>,
-    peer_ephemeral_public: Option<[u8; PUBLIC_KEY_LEN]>,
-    send_key: Option<[u8; SYMMETRIC_KEY_LEN]>,
-    recv_key: Option<[u8; SYMMETRIC_KEY_LEN]>,
 }
 
 impl Handshake {
@@ -144,9 +159,10 @@ impl Handshake {
     ///
     /// Only valid in [`HandshakeState::ExpectHelloReply`] (initiator).
     pub fn send_hello(&mut self) -> Result<Vec<u8>, FengniError> {
-        if self.state != HandshakeState::ExpectHelloReply {
-            return Err(HandshakeError::AlreadyCompleted.into());
-        }
+        let _peer_static = match &self.state {
+            HandshakeState::ExpectHelloReply { .. } => {}
+            _ => return Err(HandshakeError::AlreadyCompleted.into()),
+        };
 
         let ts = current_timestamp();
         let hello = Hello {
@@ -159,6 +175,29 @@ impl Handshake {
         };
 
         Ok(crate::wire::encode(&msg)?)
+    }
+
+    /// Build and write the Hello message into a caller-provided buffer.
+    ///
+    /// Returns the number of bytes written. Use [`FengniMessage::encoded_len`]
+    /// on a Hello message to determine the required buffer size.
+    ///
+    /// Only valid in [`HandshakeState::ExpectHelloReply`] (initiator).
+    pub fn send_hello_into(&mut self, buf: &mut [u8]) -> Result<usize, FengniError> {
+        let _peer_static = match &self.state {
+            HandshakeState::ExpectHelloReply { .. } => {}
+            _ => return Err(HandshakeError::AlreadyCompleted.into()),
+        };
+
+        let hello = Hello {
+            ephemeral_public: self.ephemeral.public_key_bytes().to_vec().into(),
+            timestamp: current_timestamp(),
+        };
+        let msg = FengniMessage {
+            variant: Some(Variant::Hello(hello)),
+        };
+
+        Ok(crate::wire::encode_into(&msg, buf)?)
     }
 
     /// Process an incoming handshake message and return the next message to
@@ -195,7 +234,6 @@ impl Handshake {
                     .as_ref()
                     .try_into()
                     .map_err(|_| HandshakeError::Malformed)?;
-                self.peer_ephemeral_public = Some(peer_ephemeral);
 
                 // ee = ECDH(our_ephem, peer_ephem)
                 let ee = crypto::diffie_hellman(
@@ -213,7 +251,9 @@ impl Handshake {
                 let nonce = [0u8; crypto::NONCE_LEN];
                 let session_token = crypto::encrypt(&hk, &nonce, &token_plaintext)?;
 
-                self.state = HandshakeState::ExpectAuthenticate;
+                self.state = HandshakeState::ExpectAuthenticate {
+                    peer_ephemeral_public: peer_ephemeral,
+                };
 
                 let reply = HelloReply {
                     ephemeral_public: self.ephemeral.public_key_bytes().to_vec().into(),
@@ -229,7 +269,7 @@ impl Handshake {
 
             // ── Initiator receives HelloReply → sends Authenticate ──
             (
-                HandshakeState::ExpectHelloReply,
+                HandshakeState::ExpectHelloReply { peer_static_public },
                 Some(Variant::HelloReply(HelloReply {
                     ephemeral_public,
                     session_token,
@@ -239,7 +279,7 @@ impl Handshake {
                     .as_ref()
                     .try_into()
                     .map_err(|_| HandshakeError::Malformed)?;
-                self.peer_ephemeral_public = Some(peer_ephemeral);
+                
 
                 // ee = ECDH(our_ephem, peer_ephem)
                 let ee = crypto::diffie_hellman(
@@ -258,12 +298,10 @@ impl Handshake {
                     token_plaintext[..PUBLIC_KEY_LEN].try_into().unwrap();
 
                 // Verify responder identity matches pinned key
-                if let Some(expected) = &self.peer_identity_public {
-                    if claimed_identity != *expected {
+                if claimed_identity != peer_static_public {
                         return Err(HandshakeError::IdentityRejected.into());
-                    }
                 }
-                self.peer_identity_public = Some(claimed_identity);
+                
 
                 // Build HMAC proof: HMAC-SHA256(hk, our_identity_pub || PROOF_CONTEXT)
                 let proof: [u8; crypto::HMAC_TAG_LEN] = crypto::hmac_sha256(
@@ -271,10 +309,27 @@ impl Handshake {
                     &[&self.identity.public_key_bytes(), PROOF_CONTEXT],
                 );
 
-                self.state = HandshakeState::ExpectServerFinish;
+                // Encrypt identity with es = DH(our_ephem, peer_static)
+                // Only the intended responder can decrypt this.
+                let es_id = crypto::diffie_hellman(
+                    self.ephemeral.secret(),
+                    &x25519_dalek::PublicKey::from(peer_static_public),
+                );
+                let identity_key = crypto::derive_key(&es_id, HKDF_INFO_IDENTITY_HIDE)?;
+                let nonce = [0u8; crypto::NONCE_LEN];
+                let encrypted_identity = crypto::encrypt(
+                    &identity_key,
+                    &nonce,
+                    &self.identity.public_key_bytes(),
+                )?;
+
+                self.state = HandshakeState::ExpectServerFinish {
+                    peer_ephemeral_public: peer_ephemeral,
+                    peer_identity_public: claimed_identity,
+                };
 
                 let auth = Authenticate {
-                    identity_public: self.identity.public_key_bytes().to_vec().into(),
+                    identity_public: encrypted_identity.into(),
                     proof: proof.to_vec().into(),
                 };
 
@@ -287,25 +342,32 @@ impl Handshake {
 
             // ── Responder receives Authenticate → sends ServerFinish ──
             (
-                HandshakeState::ExpectAuthenticate,
+                HandshakeState::ExpectAuthenticate { peer_ephemeral_public },
                 Some(Variant::Authenticate(Authenticate {
                     identity_public,
                     proof,
                 })),
             ) => {
-                let peer_identity: [u8; PUBLIC_KEY_LEN] = identity_public
-                    .as_ref()
+                // Decrypt identity: DH(our_static, peer_ephemeral) = DH(peer_ephem, our_static)
+                // Only the initiator who knows our public key could have encrypted this.
+                let se_id = crypto::diffie_hellman(
+                    self.identity.secret(),
+                    &x25519_dalek::PublicKey::from(peer_ephemeral_public),
+                );
+                let identity_key = crypto::derive_key(&se_id, HKDF_INFO_IDENTITY_HIDE)?;
+                let nonce = [0u8; crypto::NONCE_LEN];
+                let decrypted_id = crypto::decrypt(&identity_key, &nonce, &identity_public)
+                    .map_err(|_| HandshakeError::IdentityRejected)?;
+                let peer_identity: [u8; PUBLIC_KEY_LEN] = decrypted_id
+                    .as_slice()
                     .try_into()
                     .map_err(|_| HandshakeError::Malformed)?;
 
-                let peer_ephemeral = self
-                    .peer_ephemeral_public
-                    .ok_or(FengniError::State("no peer ephemeral".into()))?;
 
                 // ee = ECDH(our_ephem, peer_ephem)
                 let ee = crypto::diffie_hellman(
                     self.ephemeral.secret(),
-                    &x25519_dalek::PublicKey::from(peer_ephemeral),
+                    &x25519_dalek::PublicKey::from(peer_ephemeral_public),
                 );
                 let hk = crypto::derive_key(&ee, HKDF_INFO_HELLO)?;
 
@@ -322,10 +384,6 @@ impl Handshake {
                     return Err(HandshakeError::IdentityRejected.into());
                 }
 
-                // Accept peer identity. Precompute ss.
-                self.peer_identity_public = Some(peer_identity);
-                self.identity.pin_peer(&peer_identity);
-
                 // Quadruple DH session key derivation:
                 //   ee = ECDH(our_ephem,    peer_ephem)    ← FS
                 //   es = ECDH(our_ephem,    peer_static)    ← FS + auth
@@ -337,27 +395,18 @@ impl Handshake {
                 );
                 let se = crypto::diffie_hellman(
                     self.identity.secret(),
-                    &x25519_dalek::PublicKey::from(peer_ephemeral),
+                    &x25519_dalek::PublicKey::from(peer_ephemeral_public),
                 );
-                let ss = self
-                    .identity
-                    .static_shared()
-                    .ok_or(FengniError::State("ss not precomputed".into()))?;
+                // Compute ss locally — defer pin_peer until all ops succeed.
+                let ss = *self.identity.secret()
+                    .diffie_hellman(&x25519_dalek::PublicKey::from(peer_identity))
+                    .as_bytes();
 
                 let combined = sort_and_concat(&[&ee, &es, &se, &ss]);
 
                 // Derive send/recv keys from the combined material.
-                // Initiator: send=HKDF(combined, "send"), recv=HKDF(combined, "recv")
-                // Responder: send=HKDF(combined, "recv"), recv=HKDF(combined, "send")
                 let sk1 = crypto::derive_key(&combined, HKDF_INFO_SEND)?;
                 let sk2 = crypto::derive_key(&combined, HKDF_INFO_RECV)?;
-                // Responder gives sk1 to initiator as send, and keeps sk2 as send
-                // Initiator gets sk1 → recv_key, sk2 → send_key
-                // Responder: send_key = sk1, recv_key = sk2
-                // But initiator takes sk2 as send_key and sk1 as recv_key
-                // We are the responder here.
-                self.send_key = Some(sk1);
-                self.recv_key = Some(sk2);
 
                 // Build ServerFinish under recv_key (initiator's send_key, i.e., sk2)
                 let nonce = [0u8; crypto::NONCE_LEN];
@@ -367,7 +416,12 @@ impl Handshake {
                 let confirm_key = crypto::derive_key(&combined, b"fengni-v1-handshake-confirm")?;
                 let finish_payload = crypto::encrypt(&confirm_key, &nonce, finish_plaintext)?;
 
-                self.state = HandshakeState::Completed;
+                // All computations succeeded — now commit.
+                self.identity.pin_peer(&peer_identity);
+                self.state = HandshakeState::Completed {
+                    send_key: sk1,
+                    recv_key: sk2,
+                };
 
                 let finish = ServerFinish {
                     payload: finish_payload.into(),
@@ -382,36 +436,30 @@ impl Handshake {
 
             // ── Initiator receives ServerFinish → derives send/recv keys ──
             (
-                HandshakeState::ExpectServerFinish,
+                HandshakeState::ExpectServerFinish {
+                    peer_ephemeral_public,
+                    peer_identity_public,
+                },
                 Some(Variant::ServerFinish(ServerFinish { payload })),
             ) => {
-                let peer_ephemeral = self
-                    .peer_ephemeral_public
-                    .ok_or(FengniError::State("no peer ephemeral".into()))?;
-                let peer_identity = self
-                    .peer_identity_public
-                    .ok_or(FengniError::State("no peer identity".into()))?;
-
-                // Compute ss now that we know peer identity.
-                self.identity.pin_peer(&peer_identity);
 
                 // Quadruple DH (same as responder).
                 let ee = crypto::diffie_hellman(
                     self.ephemeral.secret(),
-                    &x25519_dalek::PublicKey::from(peer_ephemeral),
+                    &x25519_dalek::PublicKey::from(peer_ephemeral_public),
                 );
                 let es = crypto::diffie_hellman(
                     self.ephemeral.secret(),
-                    &x25519_dalek::PublicKey::from(peer_identity),
+                    &x25519_dalek::PublicKey::from(peer_identity_public),
                 );
                 let se = crypto::diffie_hellman(
                     self.identity.secret(),
-                    &x25519_dalek::PublicKey::from(peer_ephemeral),
+                    &x25519_dalek::PublicKey::from(peer_ephemeral_public),
                 );
-                let ss = self
-                    .identity
-                    .static_shared()
-                    .ok_or(FengniError::State("ss not precomputed".into()))?;
+                // Compute ss locally — defer pin_peer until all ops succeed.
+                let ss = *self.identity.secret()
+                    .diffie_hellman(&x25519_dalek::PublicKey::from(peer_identity_public))
+                    .as_bytes();
 
                 let combined = sort_and_concat(&[&ee, &es, &se, &ss]);
 
@@ -429,9 +477,12 @@ impl Handshake {
                     return Err(HandshakeError::IdentityRejected.into());
                 }
 
-                self.send_key = Some(sk2);
-                self.recv_key = Some(sk1);
-                self.state = HandshakeState::Completed;
+                // All computations succeeded — now commit.
+                self.identity.pin_peer(&peer_identity_public);
+                self.state = HandshakeState::Completed {
+                    send_key: sk2,
+                    recv_key: sk1,
+                };
 
                 Ok(None)
             }
@@ -444,19 +495,15 @@ impl Handshake {
     ///
     /// Returns an error if the handshake has not completed.
     pub fn into_transport(self) -> Result<TransportState, FengniError> {
-        if !self.state.is_completed() {
-            return Err(FengniError::State("handshake not completed".into()));
+        match self.state {
+            HandshakeState::Completed { send_key, recv_key } => {
+                Ok(TransportState::new(CipherStates {
+                    send: crypto::CipherState::new(&send_key),
+                    recv: crypto::CipherState::new(&recv_key),
+                }))
+            }
+            _ => Err(FengniError::State("handshake not completed".into())),
         }
-        let send_key = self
-            .send_key
-            .ok_or(FengniError::State("no send key".into()))?;
-        let recv_key = self
-            .recv_key
-            .ok_or(FengniError::State("no recv key".into()))?;
-        Ok(TransportState::new(CipherStates {
-            send: crypto::CipherState::new(&send_key),
-            recv: crypto::CipherState::new(&recv_key),
-        }))
     }
 }
 
@@ -489,8 +536,8 @@ mod tests {
         let alice = KeyPair::generate();
         let bob_pub = KeyPair::generate().public_key_bytes();
         let hs = HandshakeBuilder::initiator(alice, bob_pub).build();
-        assert_eq!(hs.state(), HandshakeState::ExpectHelloReply);
-        assert!(hs.identity.static_shared().is_some());
+        assert!(matches!(hs.state(), HandshakeState::ExpectHelloReply { .. }));
+        assert!(hs.identity.ss.is_some());
     }
 
     #[test]
@@ -509,7 +556,7 @@ mod tests {
         alice_key.pin_peer(&bob_pub);
 
         let mut hs_a = HandshakeBuilder::initiator(alice_key.clone(), bob_pub).build();
-        assert_eq!(hs_a.state(), HandshakeState::ExpectHelloReply);
+        assert!(matches!(hs_a.state(), HandshakeState::ExpectHelloReply { .. }));
 
         let hello = hs_a.send_hello().unwrap();
         assert!(!hello.is_empty());
@@ -518,17 +565,17 @@ mod tests {
         assert_eq!(hs_b.state(), HandshakeState::ExpectHello);
 
         let reply = hs_b.handle_message(&hello).unwrap().unwrap();
-        assert_eq!(hs_b.state(), HandshakeState::ExpectAuthenticate);
+        assert!(matches!(hs_b.state(), HandshakeState::ExpectAuthenticate { .. }));
 
         let auth = hs_a.handle_message(&reply).unwrap().unwrap();
-        assert_eq!(hs_a.state(), HandshakeState::ExpectServerFinish);
+        assert!(matches!(hs_a.state(), HandshakeState::ExpectServerFinish { .. }));
 
         let finish = hs_b.handle_message(&auth).unwrap().unwrap();
-        assert_eq!(hs_b.state(), HandshakeState::Completed);
+        assert!(matches!(hs_b.state(), HandshakeState::Completed { .. }));
 
         let done = hs_a.handle_message(&finish).unwrap();
         assert!(done.is_none());
-        assert_eq!(hs_a.state(), HandshakeState::Completed);
+        assert!(matches!(hs_a.state(), HandshakeState::Completed { .. }));
 
         // Transition to transport and verify send/recv keys work
         let transport_a = hs_a.into_transport().unwrap();

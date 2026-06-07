@@ -4,6 +4,7 @@ use thiserror::Error;
 
 /// Top-level error type for all Fengni operations.
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum FengniError {
     /// A cryptographic operation failed.
     #[error("cryptographic error: {0}")]
@@ -24,6 +25,7 @@ pub enum FengniError {
 
 /// Errors from cryptographic operations.
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum CryptoError {
     /// Encryption failed.
     #[error("encryption failed")]
@@ -48,6 +50,7 @@ pub enum CryptoError {
 
 /// Errors from the handshake phase.
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum HandshakeError {
     /// The handshake has already completed.
     #[error("handshake already completed")]
@@ -75,6 +78,7 @@ pub enum HandshakeError {
 
 /// Errors from wire format operations.
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum WireError {
     /// Protobuf encoding failed.
     #[error("encode failed: {0}")]

@@ -67,4 +67,20 @@ impl TransportState {
     pub fn recv(&self, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
         self.recv.borrow_mut().decrypt(ciphertext)
     }
+
+    /// Encrypt `plaintext` into a caller-provided buffer (zero-copy).
+    ///
+    /// Writes ciphertext + tag into `out`, returns bytes written.
+    /// Requires `out.len() >= plaintext.len() + ` [`crypto::TAG_LEN`].
+    pub fn send_into(&self, plaintext: &[u8], out: &mut [u8]) -> Result<usize, CryptoError> {
+        self.send.borrow_mut().encrypt_into(plaintext, out)
+    }
+
+    /// Decrypt `ciphertext` into a caller-provided buffer (zero-copy).
+    ///
+    /// Writes plaintext into `out`, returns bytes written.
+    /// Requires `out.len() >= ciphertext.len() - ` [`crypto::TAG_LEN`].
+    pub fn recv_into(&self, ciphertext: &[u8], out: &mut [u8]) -> Result<usize, CryptoError> {
+        self.recv.borrow_mut().decrypt_into(ciphertext, out)
+    }
 }

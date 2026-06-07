@@ -19,7 +19,7 @@
 
 use crate::error::CryptoError;
 use chacha20poly1305::{
-    aead::{Aead, KeyInit, OsRng},
+    aead::{Aead, AeadInPlace, KeyInit, OsRng},
     ChaCha20Poly1305, Nonce,
 };
 use hkdf::Hkdf;
@@ -84,11 +84,6 @@ impl KeyPair {
     /// Returns the public key as 32 bytes.
     pub fn public_key_bytes(&self) -> [u8; PUBLIC_KEY_LEN] {
         *self.public.as_bytes()
-    }
-
-    /// Returns the precomputed static-static DH shared secret, if any.
-    pub(crate) fn static_shared(&self) -> Option<[u8; PUBLIC_KEY_LEN]> {
-        self.ss
     }
 
     /// Returns a reference to the X25519 static secret.
@@ -188,6 +183,59 @@ pub fn diffie_hellman(secret: &StaticSecret, public: &PublicKey) -> [u8; PUBLIC_
     *secret.diffie_hellman(public).as_bytes()
 }
 
+/// Encrypt `plaintext` into a caller-provided buffer (zero-copy).
+///
+/// Writes ciphertext + tag into `out`. Returns bytes written.
+/// Requires `out.len() >= plaintext.len() + TAG_LEN`.
+/// Uses `encrypt_in_place_detached` to avoid internal allocation.
+pub fn encrypt_into(
+    key: &[u8; SYMMETRIC_KEY_LEN],
+    nonce: &[u8; NONCE_LEN],
+    plaintext: &[u8],
+    out: &mut [u8],
+) -> Result<usize, CryptoError> {
+    let expected = plaintext.len() + TAG_LEN;
+    if out.len() < expected {
+        return Err(CryptoError::Encrypt);
+    }
+    out[..plaintext.len()].copy_from_slice(plaintext);
+    let cipher = ChaCha20Poly1305::new_from_slice(key).map_err(|_| CryptoError::Encrypt)?;
+    let nonce = Nonce::from_slice(nonce);
+    let tag = cipher
+        .encrypt_in_place_detached(nonce, b"", &mut out[..plaintext.len()])
+        .map_err(|_| CryptoError::Encrypt)?;
+    out[plaintext.len()..expected].copy_from_slice(&tag);
+    Ok(expected)
+}
+
+/// Decrypt `ciphertext` into a caller-provided buffer (zero-copy).
+///
+/// Writes plaintext into `out`. Returns bytes written.
+/// Requires `out.len() >= ciphertext.len() - TAG_LEN`.
+/// Uses `decrypt_in_place_detached` to avoid internal allocation.
+pub fn decrypt_into(
+    key: &[u8; SYMMETRIC_KEY_LEN],
+    nonce: &[u8; NONCE_LEN],
+    ciphertext: &[u8],
+    out: &mut [u8],
+) -> Result<usize, CryptoError> {
+    if ciphertext.len() < TAG_LEN {
+        return Err(CryptoError::Decrypt);
+    }
+    let pt_len = ciphertext.len() - TAG_LEN;
+    if out.len() < pt_len {
+        return Err(CryptoError::Decrypt);
+    }
+    out[..ciphertext.len()].copy_from_slice(ciphertext);
+    let cipher = ChaCha20Poly1305::new_from_slice(key).map_err(|_| CryptoError::Decrypt)?;
+    let nonce = Nonce::from_slice(nonce);
+    let tag = chacha20poly1305::aead::Tag::<ChaCha20Poly1305>::from_slice(&ciphertext[pt_len..]);
+    cipher
+        .decrypt_in_place_detached(nonce, b"", &mut out[..pt_len], tag)
+        .map_err(|_| CryptoError::Decrypt)?;
+    Ok(pt_len)
+}
+
 // --- CipherState ---
 
 /// A stateful authenticated encryption key with automatic nonce management.
@@ -246,6 +294,38 @@ impl CipherState {
         Ok(pt)
     }
 
+    /// Encrypt `plaintext` into a caller-provided buffer (zero-copy).
+    ///
+    /// Writes ciphertext + tag into `out`, returns bytes written.
+    /// Requires `out.len() >= plaintext.len() + TAG_LEN`.
+    pub fn encrypt_into(&mut self, plaintext: &[u8], out: &mut [u8]) -> Result<usize, CryptoError> {
+        if !self.has_key {
+            return Err(CryptoError::Encrypt);
+        }
+        validate_nonce(self.n)?;
+        let mut nonce_bytes = [0u8; NONCE_LEN];
+        nonce_bytes[4..12].copy_from_slice(&self.n.to_le_bytes());
+        let written = encrypt_into(&self.key, &nonce_bytes, plaintext, out)?;
+        self.n += 1;
+        Ok(written)
+    }
+
+    /// Decrypt `ciphertext` into a caller-provided buffer (zero-copy).
+    ///
+    /// Writes plaintext into `out`, returns bytes written.
+    /// Requires `out.len() >= ciphertext.len() - TAG_LEN`.
+    pub fn decrypt_into(&mut self, ciphertext: &[u8], out: &mut [u8]) -> Result<usize, CryptoError> {
+        if !self.has_key {
+            return Err(CryptoError::Decrypt);
+        }
+        validate_nonce(self.n)?;
+        let mut nonce_bytes = [0u8; NONCE_LEN];
+        nonce_bytes[4..12].copy_from_slice(&self.n.to_le_bytes());
+        let written = decrypt_into(&self.key, &nonce_bytes, ciphertext, out)?;
+        self.n += 1;
+        Ok(written)
+    }
+
     /// Rekey by encrypting a zero-block with nonce `u64::MAX`.
     ///
     /// Per Noise spec Section 4.2: `REKEY(k) = ENCRYPT(k, 2^64-1, 0^32)`.
@@ -299,7 +379,7 @@ mod tests {
     fn keypair_generate_is_valid() {
         let kp = KeyPair::generate();
         assert_eq!(kp.public_key_bytes().len(), PUBLIC_KEY_LEN);
-        assert!(kp.static_shared().is_none());
+        assert!(kp.ss.is_none());
     }
 
     #[test]
@@ -314,12 +394,12 @@ mod tests {
         let mut alice = KeyPair::generate();
         let bob = KeyPair::generate();
         alice.pin_peer(&bob.public_key_bytes());
-        assert!(alice.static_shared().is_some());
-
         // ss = DH(alice_static, bob_static) = DH(bob_static, alice_static)
+        let ss_direct = *alice.secret().diffie_hellman(&x25519_dalek::PublicKey::from(bob.public_key_bytes())).as_bytes();
         let mut bob2 = KeyPair::from_bytes(bob.secret.to_bytes());
         bob2.pin_peer(&alice.public_key_bytes());
-        assert_eq!(alice.static_shared().unwrap(), bob2.static_shared().unwrap());
+        let ss_peer = *bob2.secret().diffie_hellman(&x25519_dalek::PublicKey::from(alice.public_key_bytes())).as_bytes();
+        assert_eq!(ss_direct, ss_peer);
     }
 
     #[test]

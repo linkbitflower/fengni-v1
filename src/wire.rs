@@ -35,7 +35,7 @@ pub struct HelloReply {
 /// Proves the initiator's identity to the responder.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Authenticate {
-    /// Initiator's long-term X25519 public key (32 bytes)
+    /// Encrypted initiator identity (32-byte X25519 public key, encrypted with es key)
     #[prost(bytes, tag = "1")]
     pub identity_public: ::prost::bytes::Bytes,
     /// Signature or MAC proving possession of the identity private key
@@ -91,12 +91,23 @@ pub mod fengni_message {
 // --- Encode / Decode ---
 
 use prost::Message;
+use bytes::BufMut;
 
 /// Encode a FengniMessage to protobuf bytes.
 pub fn encode(msg: &FengniMessage) -> Result<Vec<u8>, prost::EncodeError> {
     let mut buf = Vec::with_capacity(msg.encoded_len());
     msg.encode(&mut buf)?;
     Ok(buf)
+}
+
+/// Encode a FengniMessage into a caller-provided buffer.
+///
+/// Returns the number of bytes written. The caller must ensure
+/// `buf.len() >= msg.encoded_len()` — use [`FengniMessage::encoded_len`].
+pub fn encode_into(msg: &FengniMessage, buf: &mut [u8]) -> Result<usize, prost::EncodeError> {
+    let len = msg.encoded_len();
+    msg.encode(&mut &mut buf[..len])?;
+    Ok(len)
 }
 
 /// Decode a FengniMessage from protobuf bytes.
