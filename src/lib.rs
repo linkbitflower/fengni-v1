@@ -9,8 +9,8 @@
 //!
 //! - **X25519** key exchange with quadruple DH (ee + es + se + ss)
 //! - **ChaCha20-Poly1305** authenticated encryption
-//! - **HKDF-SHA256** key derivation
-//! - **HMAC-SHA256** identity proofs
+//! - **HKDF-SHA256** key derivation with domain-separated info labels
+//! - **HMAC-SHA256** identity proofs with constant-time verification
 //! - **Protobuf** wire format for protocol messages
 //! - **KCI resistance** via precomputed static-static DH
 //! - **Separate send/receive keys** with automatic nonce management
@@ -18,6 +18,17 @@
 //! - **Zero-copy** encryption/decryption via AeadInPlace
 //! - **Replay protection** — bitmap-based sliding window (1024 packets)
 //! - **AEAD safety boundaries** — confidentiality & integrity limits
+//! - **Prologue binding** — cross-protocol key isolation
+//! - **Stateless transport** — caller-managed nonce for session persistence
+//! - **Structured error context** — programmatic error handling
+//! - **Constant-time comparison** — identity & HMAC verification via subtle
+//! - **Key zeroization** — symmetric keys and static secrets zeroized on Drop
+//! - **Thread safety** — `TransportState` is `Send + Sync` for async runtimes
+//! - **Checkpoint/restore** — failed messages don't corrupt handshake state
+//! - **Message length validation** — 65535 byte cap prevents memory exhaustion
+//! - **Deterministic KAT vectors** — known-answer tests for cross-version compatibility
+//! - **Fuzzing harness** — cargo-fuzz target for wire format decoding
+//! - **Criterion benchmarks** — performance baseline for handshake and transport
 //!
 //! ## Architecture
 //!

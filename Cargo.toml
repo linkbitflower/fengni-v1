@@ -1,6 +1,6 @@
 [package]
 name = "fengni"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 description = "An encrypted communication protocol library"
 license = "MIT OR Apache-2.0"
@@ -17,6 +17,12 @@ hkdf = "0.12"
 sha2 = "0.10"
 hmac = "0.12"
 
+# Constant-time operations
+subtle = { version = "2", default-features = false }
+
+# Secure memory handling
+zeroize = { version = "1", features = ["derive"] }
+
 # Serialization
 prost = "0.13"
 bytes = "1"
@@ -26,3 +32,10 @@ thiserror = "2"
 
 [dev-dependencies]
 hex = "0.4"
+
+[target.'cfg(not(fuzz))'.dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "crypto_bench"
+harness = false

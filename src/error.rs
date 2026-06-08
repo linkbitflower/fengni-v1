@@ -41,6 +41,16 @@ pub enum CryptoError {
     #[error("nonce replayed — possible replay attack")]
     NonceReplayed,
 
+    /// The nonce counter has reached its maximum value.
+    ///
+    /// Per Noise spec Section 4.2, `u64::MAX` is reserved for rekey.
+    /// Call [`rekey()`](crate::crypto::CipherState::rekey) or
+    /// [`rekey_send`](crate::transport::TransportState::rekey_send) /
+    /// [`rekey_recv`](crate::transport::TransportState::rekey_recv)
+    /// to rotate the key and reset the nonce counter.
+    #[error("nonce exhausted — key must be rekeyed")]
+    NonceExhausted,
+
     /// Key derivation failed.
     #[error("key derivation failed")]
     KeyDerivation,

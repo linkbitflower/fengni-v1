@@ -29,7 +29,7 @@
 
 use crate::crypto::{CipherStates, ReplayValidator};
 use crate::error::CryptoError;
-use core::cell::RefCell;
+use std::sync::{atomic::AtomicU64, atomic::Ordering, Mutex};
 
 /// The transport state after a successful handshake.
 ///
@@ -38,23 +38,31 @@ use core::cell::RefCell;
 ///
 /// - Alice's `send` key = Bob's `recv` key
 /// - Alice's `recv` key = Bob's `send` key
+///
+/// # Thread Safety
+///
+/// `TransportState` is `Send + Sync`. The send and receive paths use
+/// independent locks — send and recv can proceed concurrently without
+/// contention. Pattern from boringtun's `Session` which uses `AtomicU64`
+/// for the sending counter and `Mutex<ReceivingKeyCounterValidator>`
+/// for the receiving counter.
 pub struct TransportState {
-    send: RefCell<crate::crypto::CipherState>,
-    recv: RefCell<crate::crypto::CipherState>,
+    send: Mutex<crate::crypto::CipherState>,
+    recv: Mutex<crate::crypto::CipherState>,
     /// Bitmap-based replay protection for received packets.
-    replay: RefCell<ReplayValidator>,
+    replay: Mutex<ReplayValidator>,
     /// Count of failed decryption attempts (for integrity limit tracking).
-    auth_failures: RefCell<u64>,
+    auth_failures: AtomicU64,
 }
 
 impl TransportState {
     /// Create a new TransportState from pre-derived CipherStates.
     pub(crate) fn new(keys: CipherStates) -> Self {
         Self {
-            send: RefCell::new(keys.send),
-            recv: RefCell::new(keys.recv),
-            replay: RefCell::new(ReplayValidator::new()),
-            auth_failures: RefCell::new(0),
+            send: Mutex::new(keys.send),
+            recv: Mutex::new(keys.recv),
+            replay: Mutex::new(ReplayValidator::new()),
+            auth_failures: AtomicU64::new(0),
         }
     }
 
@@ -77,7 +85,7 @@ impl TransportState {
 
     /// Returns the current number of authentication (decryption) failures.
     pub fn auth_failures(&self) -> u64 {
-        *self.auth_failures.borrow()
+        self.auth_failures.load(Ordering::Relaxed)
     }
 
     // --- Encrypt/Decrypt ---
@@ -92,7 +100,7 @@ impl TransportState {
     /// Returns `CryptoError::Encrypt` if the nonce counter has
     /// reached the maximum value. Call [`rekey_send`](Self::rekey_send) to rotate.
     pub fn send(&self, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
-        self.send.borrow_mut().encrypt(plaintext)
+        self.send.lock().unwrap().encrypt(plaintext)
     }
 
     /// Decrypt `ciphertext` from the peer using the recv key.
@@ -110,21 +118,20 @@ impl TransportState {
     /// - `CryptoError::Encrypt` if the nonce counter has reached the
     ///   maximum value (this variant is reused for "too old" nonces).
     pub fn recv(&self, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
-        // Pre-check: validate nonce before expensive decryption
-        let nonce_val = self.recv.borrow().nonce();
-        if let Err(e) = self.replay.borrow_mut().will_accept(nonce_val) {
-            return Err(e);
-        }
+        // Pre-check: validate nonce before expensive decryption.
+        // Hold the recv lock across nonce read + replay check + decrypt
+        // to prevent TOCTOU races when called from multiple threads.
+        let mut recv = self.recv.lock().unwrap();
+        let nonce_val = recv.nonce();
+        self.replay.lock().unwrap().will_accept(nonce_val)?;
 
-        match self.recv.borrow_mut().decrypt(ciphertext) {
+        match recv.decrypt(ciphertext) {
             Ok(pt) => {
-                // Success — mark the nonce as received
-                self.replay.borrow_mut().mark_did_receive(nonce_val);
+                self.replay.lock().unwrap().mark_did_receive(nonce_val);
                 Ok(pt)
             }
             Err(e) => {
-                // Decrypt failed — track for integrity limit
-                *self.auth_failures.borrow_mut() += 1;
+                self.auth_failures.fetch_add(1, Ordering::Relaxed);
                 Err(e)
             }
         }
@@ -135,7 +142,7 @@ impl TransportState {
     /// Writes ciphertext + tag into `out`, returns bytes written.
     /// Requires `out.len() >= plaintext.len() + ` [`crypto::TAG_LEN`].
     pub fn send_into(&self, plaintext: &[u8], out: &mut [u8]) -> Result<usize, CryptoError> {
-        self.send.borrow_mut().encrypt_into(plaintext, out)
+        self.send.lock().unwrap().encrypt_into(plaintext, out)
     }
 
     /// Decrypt `ciphertext` into a caller-provided buffer (zero-copy).
@@ -149,21 +156,18 @@ impl TransportState {
     /// - `CryptoError::NonceReplayed` — duplicate nonce detected.
     /// - `CryptoError::Decrypt` — authentication failure.
     pub fn recv_into(&self, ciphertext: &[u8], out: &mut [u8]) -> Result<usize, CryptoError> {
-        // Pre-check: validate nonce before expensive decryption
-        let nonce_val = self.recv.borrow().nonce();
-        if let Err(e) = self.replay.borrow_mut().will_accept(nonce_val) {
-            return Err(e);
-        }
+        // Pre-check: validate nonce before expensive decryption.
+        let mut recv = self.recv.lock().unwrap();
+        let nonce_val = recv.nonce();
+        self.replay.lock().unwrap().will_accept(nonce_val)?;
 
-        match self.recv.borrow_mut().decrypt_into(ciphertext, out) {
+        match recv.decrypt_into(ciphertext, out) {
             Ok(written) => {
-                // Success — mark the nonce as received
-                self.replay.borrow_mut().mark_did_receive(nonce_val);
+                self.replay.lock().unwrap().mark_did_receive(nonce_val);
                 Ok(written)
             }
             Err(e) => {
-                // Decrypt failed — track for integrity limit
-                *self.auth_failures.borrow_mut() += 1;
+                self.auth_failures.fetch_add(1, Ordering::Relaxed);
                 Err(e)
             }
         }
@@ -173,12 +177,22 @@ impl TransportState {
     ///
     /// Advances to a new send key per Noise spec Section 4.2.
     pub fn rekey_send(&self) -> Result<(), CryptoError> {
-        self.send.borrow_mut().rekey()
+        self.send.lock().unwrap().rekey()
     }
 
     /// Explicitly rekey the receive cipher state.
+    ///
+    /// Resets the ReplayValidator alongside the key. This is necessary because
+    /// rekeying resets the nonce to 0, so the old validator window (which tracks
+    /// high nonces) would reject all new legitimate messages as "too old."
+    ///
+    /// Pattern: WireGuard/boringtun creates a new `Session` on rekey rather
+    /// than rekeying in-place, which naturally resets the validator. fengni
+    /// achieves the same by explicitly resetting the validator.
     pub fn rekey_recv(&self) -> Result<(), CryptoError> {
-        self.recv.borrow_mut().rekey()
+        self.recv.lock().unwrap().rekey()?;
+        *self.replay.lock().unwrap() = ReplayValidator::new();
+        Ok(())
     }
 
     // --- Stateless methods (caller manages nonce) ---
@@ -189,7 +203,7 @@ impl TransportState {
     /// serialization, connection migration, or multi-threaded encryption
     /// where the caller partitions the nonce space.
     pub fn send_with_nonce(&self, nonce: u64, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
-        self.send.borrow().encrypt_with_nonce(nonce, plaintext)
+        self.send.lock().unwrap().encrypt_with_nonce(nonce, plaintext)
     }
 
     /// Zero-copy encrypt with an explicit nonce.
@@ -199,23 +213,21 @@ impl TransportState {
         plaintext: &[u8],
         out: &mut [u8],
     ) -> Result<usize, CryptoError> {
-        self.send.borrow().encrypt_into_with_nonce(nonce, plaintext, out)
+        self.send.lock().unwrap().encrypt_into_with_nonce(nonce, plaintext, out)
     }
 
     /// Decrypt with an explicit nonce (does not consume `&mut self` internal counter).
     ///
     /// Includes replay protection against the provided nonce.
     pub fn recv_with_nonce(&self, nonce: u64, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
-        if let Err(e) = self.replay.borrow_mut().will_accept(nonce) {
-            return Err(e);
-        }
-        match self.recv.borrow().decrypt_with_nonce(nonce, ciphertext) {
+        self.replay.lock().unwrap().will_accept(nonce)?;
+        match self.recv.lock().unwrap().decrypt_with_nonce(nonce, ciphertext) {
             Ok(pt) => {
-                self.replay.borrow_mut().mark_did_receive(nonce);
+                self.replay.lock().unwrap().mark_did_receive(nonce);
                 Ok(pt)
             }
             Err(e) => {
-                *self.auth_failures.borrow_mut() += 1;
+                self.auth_failures.fetch_add(1, Ordering::Relaxed);
                 Err(e)
             }
         }
@@ -230,16 +242,14 @@ impl TransportState {
         ciphertext: &[u8],
         out: &mut [u8],
     ) -> Result<usize, CryptoError> {
-        if let Err(e) = self.replay.borrow_mut().will_accept(nonce) {
-            return Err(e);
-        }
-        match self.recv.borrow().decrypt_into_with_nonce(nonce, ciphertext, out) {
+        self.replay.lock().unwrap().will_accept(nonce)?;
+        match self.recv.lock().unwrap().decrypt_into_with_nonce(nonce, ciphertext, out) {
             Ok(written) => {
-                self.replay.borrow_mut().mark_did_receive(nonce);
+                self.replay.lock().unwrap().mark_did_receive(nonce);
                 Ok(written)
             }
             Err(e) => {
-                *self.auth_failures.borrow_mut() += 1;
+                self.auth_failures.fetch_add(1, Ordering::Relaxed);
                 Err(e)
             }
         }

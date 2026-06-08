@@ -24,7 +24,9 @@ use chacha20poly1305::{
 };
 use hkdf::Hkdf;
 use sha2::Sha256;
+use subtle::ConstantTimeEq;
 use x25519_dalek::{PublicKey, StaticSecret};
+use zeroize::Zeroize;
 
 // --- Constants ---
 
@@ -103,6 +105,17 @@ impl KeyPair {
     }
 }
 
+impl Drop for KeyPair {
+    fn drop(&mut self) {
+        // Zeroize the static secret and any cached DH shared secret
+        // on drop. Pattern: rustls OkmBlock.
+        self.secret.zeroize();
+        if let Some(ref mut ss) = self.ss {
+            ss.zeroize();
+        }
+    }
+}
+
 impl core::fmt::Debug for KeyPair {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("KeyPair")
@@ -153,14 +166,19 @@ pub fn hmac_sha256(key: &[u8; SYMMETRIC_KEY_LEN], data: &[&[u8]]) -> [u8; HMAC_T
 }
 
 /// Verify a constant-time HMAC-SHA256 tag.
+///
+/// Uses `subtle::ConstantTimeEq` to prevent timing side-channels
+/// during tag comparison. Pattern from boringtun's
+/// `ring::constant_time::verify_slices_are_equal`.
 pub fn hmac_verify(
     key: &[u8; SYMMETRIC_KEY_LEN],
     data: &[&[u8]],
     expected: &[u8; HMAC_TAG_LEN],
 ) -> bool {
     let tag = hmac_sha256(key, data);
-    // Constant-time comparison via the sha2/hmac crates' PartialEq on array
-    tag == *expected
+    // Constant-time comparison via the subtle crate
+    // — cannot be optimized to early-exit by the compiler.
+    tag.ct_eq(expected).into()
 }
 
 // --- AEAD Encryption ---
@@ -277,10 +295,25 @@ pub fn decrypt_into(
 ///
 /// Wraps a ChaCha20-Poly1305 key with a monotonic nonce counter. Nonce `u64::MAX`
 /// is reserved for `rekey()` per Noise spec Section 4.2.
+///
+/// On drop, the key material is zeroized to prevent key leakage via memory
+/// inspection. Pattern from rustls' `OkmBlock` which implements `Drop` +
+/// `Zeroize::zeroize()`.
+#[derive(Zeroize)]
 pub struct CipherState {
     key: [u8; SYMMETRIC_KEY_LEN],
     n: u64,
     has_key: bool,
+}
+
+impl Drop for CipherState {
+    fn drop(&mut self) {
+        // Zeroize the symmetric key on drop.
+        // Pattern: rustls OkmBlock — key material must not persist in
+        // memory beyond its useful lifetime.
+        self.key.zeroize();
+        self.n = 0;
+    }
 }
 
 impl CipherState {
@@ -545,7 +578,7 @@ impl ReplayValidator {
             } else {
                 // Small gap: clear intermediate words
                 let mut i = self.next;
-                while i % REPLAY_WORD_SIZE != 0 && i < counter {
+                while !i.is_multiple_of(REPLAY_WORD_SIZE) && i < counter {
                     self.clear_bit(i);
                     i += 1;
                 }
@@ -607,9 +640,12 @@ impl Default for ReplayValidator {
 }
 
 /// Validate that a nonce has not reached the reserved value.
+///
+/// Returns `Err(NonceExhausted)` if the nonce equals `u64::MAX`,
+/// which is reserved for `rekey()` per Noise spec Section 4.2.
 fn validate_nonce(n: u64) -> Result<(), CryptoError> {
     if n == u64::MAX {
-        Err(CryptoError::Encrypt)
+        Err(CryptoError::NonceExhausted)
     } else {
         Ok(())
     }
