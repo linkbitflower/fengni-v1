@@ -400,6 +400,72 @@ impl CipherState {
         self.key = *key;
         self.n = 0;
     }
+
+    // --- Stateless methods (caller manages nonce) ---
+
+    /// Encrypt with an explicit nonce (does not consume `&mut self`).
+    ///
+    /// The caller is responsible for nonce uniqueness. Internal nonce
+    /// counter is untouched. Use for session serialization or multi-thread
+    /// encryption where the caller partitions the nonce space.
+    pub fn encrypt_with_nonce(&self, nonce: u64, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        if !self.has_key {
+            return Err(CryptoError::Encrypt);
+        }
+        validate_nonce(nonce)?;
+        let mut nonce_bytes = [0u8; NONCE_LEN];
+        nonce_bytes[4..12].copy_from_slice(&nonce.to_le_bytes());
+        encrypt(&self.key, &nonce_bytes, plaintext)
+    }
+
+    /// Decrypt with an explicit nonce (does not consume `&mut self`).
+    ///
+    /// See [`encrypt_with_nonce`](Self::encrypt_with_nonce).
+    pub fn decrypt_with_nonce(&self, nonce: u64, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        if !self.has_key {
+            return Err(CryptoError::Decrypt);
+        }
+        validate_nonce(nonce)?;
+        let mut nonce_bytes = [0u8; NONCE_LEN];
+        nonce_bytes[4..12].copy_from_slice(&nonce.to_le_bytes());
+        decrypt(&self.key, &nonce_bytes, ciphertext)
+    }
+
+    /// Zero-copy encrypt with an explicit nonce.
+    ///
+    /// Writes ciphertext + tag into `out`. Caller manages nonce.
+    pub fn encrypt_into_with_nonce(
+        &self,
+        nonce: u64,
+        plaintext: &[u8],
+        out: &mut [u8],
+    ) -> Result<usize, CryptoError> {
+        if !self.has_key {
+            return Err(CryptoError::Encrypt);
+        }
+        validate_nonce(nonce)?;
+        let mut nonce_bytes = [0u8; NONCE_LEN];
+        nonce_bytes[4..12].copy_from_slice(&nonce.to_le_bytes());
+        encrypt_into(&self.key, &nonce_bytes, plaintext, out)
+    }
+
+    /// Zero-copy decrypt with an explicit nonce.
+    ///
+    /// Writes plaintext into `out`. Caller manages nonce.
+    pub fn decrypt_into_with_nonce(
+        &self,
+        nonce: u64,
+        ciphertext: &[u8],
+        out: &mut [u8],
+    ) -> Result<usize, CryptoError> {
+        if !self.has_key {
+            return Err(CryptoError::Decrypt);
+        }
+        validate_nonce(nonce)?;
+        let mut nonce_bytes = [0u8; NONCE_LEN];
+        nonce_bytes[4..12].copy_from_slice(&nonce.to_le_bytes());
+        decrypt_into(&self.key, &nonce_bytes, ciphertext, out)
+    }
 }
 
 /// A pair of CipherStates for bidirectional communication.

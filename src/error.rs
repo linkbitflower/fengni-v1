@@ -2,6 +2,8 @@
 
 use thiserror::Error;
 
+use crate::handshake::HandshakeState;
+
 /// Top-level error type for all Fengni operations.
 #[derive(Error, Debug)]
 #[non_exhaustive]
@@ -60,9 +62,12 @@ pub enum HandshakeError {
     #[error("handshake already completed")]
     AlreadyCompleted,
 
-    /// An unexpected message type was received.
-    #[error("unexpected message type")]
-    UnexpectedMessage,
+    /// An unexpected message type was received for the current state.
+    #[error("unexpected message: expected state {expected:?}")]
+    UnexpectedMessage {
+        /// The handshake state when the message was received.
+        expected: HandshakeState,
+    },
 
     /// The timestamp is outside the acceptable window.
     #[error("timestamp expired (peer: {peer_ts}, local: {local_ts})")]
@@ -72,12 +77,18 @@ pub enum HandshakeError {
     },
 
     /// The peer's identity could not be verified.
-    #[error("identity verification failed")]
-    IdentityRejected,
+    #[error("identity verification failed: {reason}")]
+    IdentityRejected {
+        /// Why the identity check failed.
+        reason: &'static str,
+    },
 
     /// The handshake message is malformed.
-    #[error("malformed handshake message")]
-    Malformed,
+    #[error("malformed handshake message: {context}")]
+    Malformed {
+        /// Which field or section was malformed.
+        context: &'static str,
+    },
 }
 
 /// Errors from wire format operations.

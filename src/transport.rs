@@ -180,4 +180,68 @@ impl TransportState {
     pub fn rekey_recv(&self) -> Result<(), CryptoError> {
         self.recv.borrow_mut().rekey()
     }
+
+    // --- Stateless methods (caller manages nonce) ---
+
+    /// Encrypt with an explicit nonce (does not consume `&mut self` internal counter).
+    ///
+    /// The caller is responsible for nonce uniqueness. Use for session
+    /// serialization, connection migration, or multi-threaded encryption
+    /// where the caller partitions the nonce space.
+    pub fn send_with_nonce(&self, nonce: u64, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        self.send.borrow().encrypt_with_nonce(nonce, plaintext)
+    }
+
+    /// Zero-copy encrypt with an explicit nonce.
+    pub fn send_into_with_nonce(
+        &self,
+        nonce: u64,
+        plaintext: &[u8],
+        out: &mut [u8],
+    ) -> Result<usize, CryptoError> {
+        self.send.borrow().encrypt_into_with_nonce(nonce, plaintext, out)
+    }
+
+    /// Decrypt with an explicit nonce (does not consume `&mut self` internal counter).
+    ///
+    /// Includes replay protection against the provided nonce.
+    pub fn recv_with_nonce(&self, nonce: u64, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        if let Err(e) = self.replay.borrow_mut().will_accept(nonce) {
+            return Err(e);
+        }
+        match self.recv.borrow().decrypt_with_nonce(nonce, ciphertext) {
+            Ok(pt) => {
+                self.replay.borrow_mut().mark_did_receive(nonce);
+                Ok(pt)
+            }
+            Err(e) => {
+                *self.auth_failures.borrow_mut() += 1;
+                Err(e)
+            }
+        }
+    }
+
+    /// Zero-copy decrypt with an explicit nonce.
+    ///
+    /// Includes replay protection against the provided nonce.
+    pub fn recv_into_with_nonce(
+        &self,
+        nonce: u64,
+        ciphertext: &[u8],
+        out: &mut [u8],
+    ) -> Result<usize, CryptoError> {
+        if let Err(e) = self.replay.borrow_mut().will_accept(nonce) {
+            return Err(e);
+        }
+        match self.recv.borrow().decrypt_into_with_nonce(nonce, ciphertext, out) {
+            Ok(written) => {
+                self.replay.borrow_mut().mark_did_receive(nonce);
+                Ok(written)
+            }
+            Err(e) => {
+                *self.auth_failures.borrow_mut() += 1;
+                Err(e)
+            }
+        }
+    }
 }

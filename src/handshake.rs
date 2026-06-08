@@ -94,6 +94,7 @@ pub struct HandshakeBuilder {
     identity: KeyPair,
     peer_static_public: Option<[u8; PUBLIC_KEY_LEN]>,
     is_initiator: bool,
+    prologue: Vec<u8>,
 }
 
 impl HandshakeBuilder {
@@ -107,6 +108,7 @@ impl HandshakeBuilder {
             identity,
             peer_static_public: Some(peer_static_public),
             is_initiator: true,
+            prologue: Vec::new(),
         }
     }
 
@@ -118,7 +120,22 @@ impl HandshakeBuilder {
             identity,
             peer_static_public: None,
             is_initiator: false,
+            prologue: Vec::new(),
         }
+    }
+
+    /// Set an optional prologue for cross-protocol key isolation.
+    ///
+    /// The prologue is prefixed to every HKDF info label in the handshake,
+    /// ensuring that keys derived under different prologues are independent.
+    /// Both peers must agree on the prologue; a mismatch causes decryption
+    /// failure.
+    ///
+    /// Pattern from snow's `Builder::prologue()` and the TLS 1.3 `"tls13 "`
+    /// label prefix.
+    pub fn prologue(mut self, data: &[u8]) -> Self {
+        self.prologue = data.to_vec();
+        self
     }
 
     /// Build the handshake state machine.
@@ -136,6 +153,7 @@ impl HandshakeBuilder {
             state,
             identity: self.identity,
             ephemeral: KeyPair::generate(),
+            prologue: self.prologue,
         }
     }
 }
@@ -147,12 +165,30 @@ pub struct Handshake {
     state: HandshakeState,
     identity: KeyPair,
     ephemeral: KeyPair,
+    /// Optional prologue prefixed to every HKDF info label.
+    prologue: Vec<u8>,
 }
 
 impl Handshake {
     /// Returns the current handshake state.
     pub fn state(&self) -> HandshakeState {
         self.state
+    }
+
+    /// Build an HKDF info label with the optional prologue prefix.
+    ///
+    /// Example: `self.info(b"fengni-v1-handshake-hello")` returns
+    /// `prologue || b"fengni-v1-handshake-hello"` if a prologue is set,
+    /// or just the suffix if empty.
+    fn info(&self, suffix: &[u8]) -> Vec<u8> {
+        if self.prologue.is_empty() {
+            suffix.to_vec()
+        } else {
+            let mut v = Vec::with_capacity(self.prologue.len() + suffix.len());
+            v.extend_from_slice(&self.prologue);
+            v.extend_from_slice(suffix);
+            v
+        }
     }
 
     /// Build and return the Hello message.
@@ -233,14 +269,14 @@ impl Handshake {
                 let peer_ephemeral: [u8; PUBLIC_KEY_LEN] = ephemeral_public
                     .as_ref()
                     .try_into()
-                    .map_err(|_| HandshakeError::Malformed)?;
+                    .map_err(|_| HandshakeError::Malformed { context: "Hello.ephemeral_public" })?;
 
                 // ee = ECDH(our_ephem, peer_ephem)
                 let ee = crypto::diffie_hellman(
                     self.ephemeral.secret(),
                     &x25519_dalek::PublicKey::from(peer_ephemeral),
                 );
-                let hk = crypto::derive_key(&ee, HKDF_INFO_HELLO)?;
+                let hk = crypto::derive_key(&ee, &self.info(HKDF_INFO_HELLO))?;
 
                 // Session token: encrypt(our_identity_pub || timestamp)
                 let token_plaintext = {
@@ -278,28 +314,28 @@ impl Handshake {
                 let peer_ephemeral: [u8; PUBLIC_KEY_LEN] = ephemeral_public
                     .as_ref()
                     .try_into()
-                    .map_err(|_| HandshakeError::Malformed)?;
-                
+                    .map_err(|_| HandshakeError::Malformed { context: "HelloReply.ephemeral_public" })?;
+
 
                 // ee = ECDH(our_ephem, peer_ephem)
                 let ee = crypto::diffie_hellman(
                     self.ephemeral.secret(),
                     &x25519_dalek::PublicKey::from(peer_ephemeral),
                 );
-                let hk = crypto::derive_key(&ee, HKDF_INFO_HELLO)?;
+                let hk = crypto::derive_key(&ee, &self.info(HKDF_INFO_HELLO))?;
 
                 // Decrypt and verify session token
                 let nonce = [0u8; crypto::NONCE_LEN];
                 let token_plaintext = crypto::decrypt(&hk, &nonce, &session_token)?;
                 if token_plaintext.len() < PUBLIC_KEY_LEN {
-                    return Err(HandshakeError::Malformed.into());
+                    return Err(HandshakeError::Malformed { context: "session token too short" }.into());
                 }
                 let claimed_identity: [u8; PUBLIC_KEY_LEN] =
                     token_plaintext[..PUBLIC_KEY_LEN].try_into().unwrap();
 
                 // Verify responder identity matches pinned key
                 if claimed_identity != peer_static_public {
-                        return Err(HandshakeError::IdentityRejected.into());
+                        return Err(HandshakeError::IdentityRejected { reason: "public key mismatch" }.into());
                 }
                 
 
@@ -315,7 +351,7 @@ impl Handshake {
                     self.ephemeral.secret(),
                     &x25519_dalek::PublicKey::from(peer_static_public),
                 );
-                let identity_key = crypto::derive_key(&es_id, HKDF_INFO_IDENTITY_HIDE)?;
+                let identity_key = crypto::derive_key(&es_id, &self.info(HKDF_INFO_IDENTITY_HIDE))?;
                 let nonce = [0u8; crypto::NONCE_LEN];
                 let encrypted_identity = crypto::encrypt(
                     &identity_key,
@@ -354,14 +390,14 @@ impl Handshake {
                     self.identity.secret(),
                     &x25519_dalek::PublicKey::from(peer_ephemeral_public),
                 );
-                let identity_key = crypto::derive_key(&se_id, HKDF_INFO_IDENTITY_HIDE)?;
+                let identity_key = crypto::derive_key(&se_id, &self.info(HKDF_INFO_IDENTITY_HIDE))?;
                 let nonce = [0u8; crypto::NONCE_LEN];
                 let decrypted_id = crypto::decrypt(&identity_key, &nonce, &identity_public)
-                    .map_err(|_| HandshakeError::IdentityRejected)?;
+                    .map_err(|_| HandshakeError::IdentityRejected { reason: "identity decryption failed" })?;
                 let peer_identity: [u8; PUBLIC_KEY_LEN] = decrypted_id
                     .as_slice()
                     .try_into()
-                    .map_err(|_| HandshakeError::Malformed)?;
+                    .map_err(|_| HandshakeError::Malformed { context: "Authenticate.identity_public" })?;
 
 
                 // ee = ECDH(our_ephem, peer_ephem)
@@ -369,19 +405,19 @@ impl Handshake {
                     self.ephemeral.secret(),
                     &x25519_dalek::PublicKey::from(peer_ephemeral_public),
                 );
-                let hk = crypto::derive_key(&ee, HKDF_INFO_HELLO)?;
+                let hk = crypto::derive_key(&ee, &self.info(HKDF_INFO_HELLO))?;
 
                 // Verify HMAC proof
                 let proof_bytes: [u8; crypto::HMAC_TAG_LEN] = proof
                     .as_ref()
                     .try_into()
-                    .map_err(|_| HandshakeError::Malformed)?;
+                    .map_err(|_| HandshakeError::Malformed { context: "Authenticate.proof" })?;
                 if !crypto::hmac_verify(
                     &hk,
                     &[&peer_identity, PROOF_CONTEXT],
                     &proof_bytes,
                 ) {
-                    return Err(HandshakeError::IdentityRejected.into());
+                    return Err(HandshakeError::IdentityRejected { reason: "HMAC proof invalid" }.into());
                 }
 
                 // Quadruple DH session key derivation:
@@ -405,15 +441,15 @@ impl Handshake {
                 let combined = sort_and_concat(&[&ee, &es, &se, &ss]);
 
                 // Derive send/recv keys from the combined material.
-                let sk1 = crypto::derive_key(&combined, HKDF_INFO_SEND)?;
-                let sk2 = crypto::derive_key(&combined, HKDF_INFO_RECV)?;
+                let sk1 = crypto::derive_key(&combined, &self.info(HKDF_INFO_SEND))?;
+                let sk2 = crypto::derive_key(&combined, &self.info(HKDF_INFO_RECV))?;
 
                 // Build ServerFinish under recv_key (initiator's send_key, i.e., sk2)
                 let nonce = [0u8; crypto::NONCE_LEN];
                 let finish_plaintext = b"fengni-handshake-complete";
                 // For ServerFinish, we encrypt with the session confirmation key.
                 // Use a dedicated label.
-                let confirm_key = crypto::derive_key(&combined, b"fengni-v1-handshake-confirm")?;
+                let confirm_key = crypto::derive_key(&combined, &self.info(b"fengni-v1-handshake-confirm"))?;
                 let finish_payload = crypto::encrypt(&confirm_key, &nonce, finish_plaintext)?;
 
                 // All computations succeeded — now commit.
@@ -463,18 +499,18 @@ impl Handshake {
 
                 let combined = sort_and_concat(&[&ee, &es, &se, &ss]);
 
-                let sk1 = crypto::derive_key(&combined, HKDF_INFO_SEND)?;
-                let sk2 = crypto::derive_key(&combined, HKDF_INFO_RECV)?;
+                let sk1 = crypto::derive_key(&combined, &self.info(HKDF_INFO_SEND))?;
+                let sk2 = crypto::derive_key(&combined, &self.info(HKDF_INFO_RECV))?;
                 // Initiator: send_key = sk2, recv_key = sk1
                 // (mirror of responder)
 
                 // Verify ServerFinish
-                let confirm_key = crypto::derive_key(&combined, b"fengni-v1-handshake-confirm")?;
+                let confirm_key = crypto::derive_key(&combined, &self.info(b"fengni-v1-handshake-confirm"))?;
                 let nonce = [0u8; crypto::NONCE_LEN];
                 let plaintext = crypto::decrypt(&confirm_key, &nonce, &payload)
-                    .map_err(|_| HandshakeError::IdentityRejected)?;
+                    .map_err(|_| HandshakeError::IdentityRejected { reason: "ServerFinish decryption failed" })?;
                 if plaintext != b"fengni-handshake-complete" {
-                    return Err(HandshakeError::IdentityRejected.into());
+                    return Err(HandshakeError::IdentityRejected { reason: "ServerFinish confirm failed" }.into());
                 }
 
                 // All computations succeeded — now commit.
@@ -487,7 +523,7 @@ impl Handshake {
                 Ok(None)
             }
 
-            _ => Err(HandshakeError::UnexpectedMessage.into()),
+            _ => Err(HandshakeError::UnexpectedMessage { expected: self.state }.into()),
         }
     }
 
@@ -721,5 +757,105 @@ mod tests {
         // ChaCha20-Poly1305 integrity limit per RFC 9001 §6.6
         assert_eq!(TransportState::integrity_limit(), 1 << 36);
         assert_eq!(TransportState::confidentiality_limit(), u64::MAX);
+    }
+
+    #[test]
+    fn prologue_mismatch_causes_handshake_failure() {
+        let mut ak = KeyPair::generate();
+        let bk = KeyPair::generate();
+        let bp = bk.public_key_bytes();
+        ak.pin_peer(&bp);
+
+        // Alice uses prologue "alice-v1", Bob uses "bob-v1" — must fail
+        let mut hs_a = HandshakeBuilder::initiator(ak, bp)
+            .prologue(b"alice-v1")
+            .build();
+        let mut hs_b = HandshakeBuilder::responder(bk)
+            .prologue(b"bob-v1")
+            .build();
+
+        let hello = hs_a.send_hello().unwrap();
+        // Bob's hello_key is derived with different prologue → decryption will fail
+        let reply = hs_b.handle_message(&hello).unwrap().unwrap();
+        // Alice tries to process with different prologue → must fail
+        let result = hs_a.handle_message(&reply);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn prologue_match_handshake_succeeds() {
+        let mut ak = KeyPair::generate();
+        let bk = KeyPair::generate();
+        let bp = bk.public_key_bytes();
+        ak.pin_peer(&bp);
+
+        let mut hs_a = HandshakeBuilder::initiator(ak, bp)
+            .prologue(b"shared-prologue")
+            .build();
+        let mut hs_b = HandshakeBuilder::responder(bk)
+            .prologue(b"shared-prologue")
+            .build();
+
+        let hello = hs_a.send_hello().unwrap();
+        let reply = hs_b.handle_message(&hello).unwrap().unwrap();
+        let auth = hs_a.handle_message(&reply).unwrap().unwrap();
+        let finish = hs_b.handle_message(&auth).unwrap().unwrap();
+        hs_a.handle_message(&finish).unwrap();
+
+        // Verify transport works
+        let ta = hs_a.into_transport().unwrap();
+        let tb = hs_b.into_transport().unwrap();
+        let ct = ta.send(b"prologue test").unwrap();
+        let pt = tb.recv(&ct).unwrap();
+        assert_eq!(pt, b"prologue test");
+    }
+
+    #[test]
+    fn stateless_transport_roundtrip() {
+        // Complete a handshake
+        let mut ak = KeyPair::generate();
+        let bk = KeyPair::generate();
+        let bp = bk.public_key_bytes();
+        ak.pin_peer(&bp);
+
+        let mut hs_a = HandshakeBuilder::initiator(ak, bp).build();
+        let mut hs_b = HandshakeBuilder::responder(bk).build();
+
+        let hello = hs_a.send_hello().unwrap();
+        let reply = hs_b.handle_message(&hello).unwrap().unwrap();
+        let auth = hs_a.handle_message(&reply).unwrap().unwrap();
+        let finish = hs_b.handle_message(&auth).unwrap().unwrap();
+        hs_a.handle_message(&finish).unwrap();
+
+        let ta = hs_a.into_transport().unwrap();
+        let tb = hs_b.into_transport().unwrap();
+
+        // Stateless send/recv with explicit nonces
+        let msg = b"stateless test message";
+        let ct = ta.send_with_nonce(42, msg).unwrap();
+        let pt = tb.recv_with_nonce(42, &ct).unwrap();
+        assert_eq!(pt, msg);
+
+        // Replay of same nonce should be rejected
+        assert!(tb.recv_with_nonce(42, &ct).is_err());
+    }
+
+    #[test]
+    fn stateless_zero_copy_roundtrip() {
+        let key = [0xAAu8; 32];
+        let cs = crate::crypto::CipherState::new(&key);
+        let pt = b"stateless zero-copy";
+
+        let mut ct_buf = vec![0u8; pt.len() + 16];
+        let w = cs.encrypt_into_with_nonce(7, pt, &mut ct_buf).unwrap();
+        assert_eq!(w, pt.len() + 16);
+
+        let mut pt_buf = vec![0u8; pt.len()];
+        let r = cs.decrypt_into_with_nonce(7, &ct_buf[..w], &mut pt_buf).unwrap();
+        assert_eq!(r, pt.len());
+        assert_eq!(&pt_buf[..r], pt);
+
+        // Internal nonce unchanged by stateless methods
+        assert_eq!(cs.nonce(), 0);
     }
 }
