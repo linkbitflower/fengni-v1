@@ -14,13 +14,17 @@
 //! - **Protobuf** wire format for protocol messages
 //! - **KCI resistance** via precomputed static-static DH
 //! - **Separate send/receive keys** with automatic nonce management
+//! - **Identity hiding** — static public key encrypted in handshake
+//! - **Zero-copy** encryption/decryption via AeadInPlace
+//! - **Replay protection** — bitmap-based sliding window (1024 packets)
+//! - **AEAD safety boundaries** — confidentiality & integrity limits
 //!
 //! ## Architecture
 //!
 //! ```text
 //! handshake.rs   — Handshake state machine + HandshakeBuilder
-//! transport.rs   — Post-handshake data channel
-//! crypto.rs      — Cryptographic primitives + CipherState
+//! transport.rs   — Post-handshake data channel + replay protection
+//! crypto.rs      — Cryptographic primitives + CipherState + ReplayValidator
 //! wire.rs        — Packet encoding/decoding
 //! error.rs       — Unified error types
 //! ```
@@ -46,7 +50,7 @@
 //!
 //! // ... complete handshake ...
 //!
-//! // After handshake, encrypt data
+//! // After handshake, encrypt data with replay protection
 //! let transport = hs_a.into_transport().unwrap();
 //! let ct = transport.send(b"hello bob").unwrap();
 //! ```
@@ -59,6 +63,7 @@ pub mod wire;
 
 // Re-export main types
 pub use crypto::KeyPair;
+pub use crypto::ReplayValidator;
 pub use handshake::{Handshake, HandshakeBuilder, HandshakeState};
 pub use transport::TransportState;
 pub use wire::FengniMessage;

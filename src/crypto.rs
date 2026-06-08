@@ -19,7 +19,7 @@
 
 use crate::error::CryptoError;
 use chacha20poly1305::{
-    aead::{Aead, KeyInit, OsRng},
+    aead::{Aead, AeadInPlace, KeyInit, OsRng},
     ChaCha20Poly1305, Nonce,
 };
 use hkdf::Hkdf;
@@ -38,6 +38,17 @@ pub const NONCE_LEN: usize = 12;
 pub const SYMMETRIC_KEY_LEN: usize = 32;
 /// Size of an HMAC-SHA256 tag in bytes.
 pub const HMAC_TAG_LEN: usize = 32;
+
+/// AEAD confidentiality limit: maximum safe encryptions under a single key.
+///
+/// For ChaCha20-Poly1305 with sequential nonces this is effectively unlimited.
+/// Ref: <https://www.ietf.org/archive/id/draft-irtf-cfrg-aead-limits-08.html#section-5.2.1>
+pub const CONFIDENTIALITY_LIMIT: u64 = u64::MAX;
+
+/// AEAD integrity limit: maximum failed decryption attempts before the key MUST be retired.
+///
+/// Ref: <https://datatracker.ietf.org/doc/html/rfc9001#section-6.6>
+pub const INTEGRITY_LIMIT: u64 = 1 << 36;
 
 // --- Key Pair ---
 
@@ -185,27 +196,46 @@ pub fn diffie_hellman(secret: &StaticSecret, public: &PublicKey) -> [u8; PUBLIC_
 
 /// Encrypt `plaintext` into a caller-provided buffer (zero-copy).
 ///
-/// Writes ciphertext + tag into `out`. Returns bytes written.
+/// Copies plaintext into `out`, encrypts in-place via
+/// `encrypt_in_place_detached`, and appends the 16-byte tag.
+/// Returns total bytes written. No internal allocation.
+///
 /// Requires `out.len() >= plaintext.len() + TAG_LEN`.
-/// Uses `encrypt_in_place_detached` to avoid internal allocation.
 pub fn encrypt_into(
     key: &[u8; SYMMETRIC_KEY_LEN],
     nonce: &[u8; NONCE_LEN],
     plaintext: &[u8],
     out: &mut [u8],
 ) -> Result<usize, CryptoError> {
-    let ct = encrypt(key, nonce, plaintext)?;
-    let len = ct.len();
-    if out.len() < len {
+    let pt_len = plaintext.len();
+    let ct_len = pt_len + TAG_LEN;
+    if out.len() < ct_len {
         return Err(CryptoError::Encrypt);
     }
-    out[..len].copy_from_slice(&ct);
-    Ok(len)
+
+    // Copy plaintext into caller buffer
+    out[..pt_len].copy_from_slice(plaintext);
+
+    let cipher = ChaCha20Poly1305::new_from_slice(key)
+        .map_err(|_| CryptoError::Encrypt)?;
+    let nonce_arr = Nonce::from_slice(nonce);
+
+    // Encrypt in-place in the caller buffer — no internal Vec
+    let tag = cipher
+        .encrypt_in_place_detached(nonce_arr, b"", &mut out[..pt_len])
+        .map_err(|_| CryptoError::Encrypt)?;
+
+    // Append tag after ciphertext
+    out[pt_len..ct_len].copy_from_slice(&tag);
+    Ok(ct_len)
 }
 
-/// Decrypt `ciphertext` into a caller-provided buffer.
+/// Decrypt `ciphertext` into a caller-provided buffer (zero-copy).
 ///
-/// Writes plaintext into `out`. Returns bytes written.
+/// Copies ciphertext body into `out`, decrypts in-place via
+/// `decrypt_in_place_detached` with the detached tag. No internal allocation.
+/// Returns plaintext length.
+///
 /// Requires `out.len() >= ciphertext.len() - TAG_LEN`.
 pub fn decrypt_into(
     key: &[u8; SYMMETRIC_KEY_LEN],
@@ -213,13 +243,32 @@ pub fn decrypt_into(
     ciphertext: &[u8],
     out: &mut [u8],
 ) -> Result<usize, CryptoError> {
-    let pt = decrypt(key, nonce, ciphertext)?;
-    let len = pt.len();
-    if out.len() < len {
+    let body_len = ciphertext
+        .len()
+        .checked_sub(TAG_LEN)
+        .ok_or(CryptoError::Decrypt)?;
+    if out.len() < body_len {
         return Err(CryptoError::Decrypt);
     }
-    out[..len].copy_from_slice(&pt);
-    Ok(len)
+
+    // Split body and tag from the incoming ciphertext
+    let body = &ciphertext[..body_len];
+    let tag_bytes = &ciphertext[body_len..];
+
+    // Copy body into caller buffer
+    out[..body_len].copy_from_slice(body);
+
+    let cipher = ChaCha20Poly1305::new_from_slice(key)
+        .map_err(|_| CryptoError::Decrypt)?;
+    let nonce_arr = Nonce::from_slice(nonce);
+    let tag_arr = chacha20poly1305::Tag::from_slice(tag_bytes);
+
+    // Decrypt in-place in the caller buffer — no internal Vec
+    cipher
+        .decrypt_in_place_detached(nonce_arr, b"", &mut out[..body_len], tag_arr)
+        .map_err(|_| CryptoError::Decrypt)?;
+
+    Ok(body_len)
 }
 
 // --- CipherState ---
@@ -248,6 +297,21 @@ impl CipherState {
     /// Returns the current nonce value.
     pub fn nonce(&self) -> u64 {
         self.n
+    }
+
+    /// AEAD confidentiality limit — maximum safe encryptions under this key.
+    ///
+    /// For ChaCha20-Poly1305 with sequential nonces this is `u64::MAX`,
+    /// but callers should treat this as the rekey threshold.
+    pub fn confidentiality_limit() -> u64 {
+        CONFIDENTIALITY_LIMIT
+    }
+
+    /// AEAD integrity limit — maximum failed decryptions before the key MUST be retired.
+    ///
+    /// After exceeding this limit, the connection should be closed and the key discarded.
+    pub fn integrity_limit() -> u64 {
+        INTEGRITY_LIMIT
     }
 
     /// Encrypt `plaintext` with the current nonce and increment.
@@ -344,6 +408,136 @@ pub struct CipherStates {
     pub send: CipherState,
     /// Key for decrypting data we receive.
     pub recv: CipherState,
+}
+
+// --- ReplayValidator ---
+
+/// Bitmap slider width in bits.
+const REPLAY_WORD_SIZE: u64 = 64;
+/// Number of words in the bitmap.
+const REPLAY_N_WORDS: u64 = 16;
+/// Total window width = 1024 packets.
+const REPLAY_N_BITS: u64 = REPLAY_WORD_SIZE * REPLAY_N_WORDS;
+
+/// Bitmap-based replay protection for received data packets.
+///
+/// Tracks a sliding window of 1024 nonce values, accepting limited
+/// reordering while rejecting duplicated or too-old counters.
+///
+/// Pattern from boringtun's `ReceivingKeyCounterValidator`.
+#[derive(Debug, Clone)]
+pub struct ReplayValidator {
+    /// Highest contiguous nonce we've received.
+    next: u64,
+    /// Bitmap of packets within the window.
+    bitmap: [u64; REPLAY_N_WORDS as usize],
+}
+
+impl ReplayValidator {
+    /// Create a new validator starting at nonce 0.
+    pub fn new() -> Self {
+        Self {
+            next: 0,
+            bitmap: [0u64; REPLAY_N_WORDS as usize],
+        }
+    }
+
+    /// Quick pre-check before decryption: returns `Ok(())` if the counter
+    /// is acceptable, `Err(NonceReplayed)` if duplicate, or
+    /// `Err(Encrypt)` if too old.
+    ///
+    /// Call before expensive decryption to avoid wasting cycles on replays.
+    #[inline]
+    pub fn will_accept(&self, counter: u64) -> Result<(), CryptoError> {
+        if counter >= self.next {
+            // Growing counter — definitely no replay
+            return Ok(());
+        }
+        if counter + REPLAY_N_BITS < self.next {
+            // Too far back in the past
+            return Err(CryptoError::Encrypt);
+        }
+        if self.check_bit(counter) {
+            // Already seen this counter
+            return Err(CryptoError::NonceReplayed);
+        }
+        Ok(())
+    }
+
+    /// Mark a counter as received after successful decryption.
+    ///
+    /// Advances the sliding window. Call only after decryption succeeds.
+    #[inline]
+    pub fn mark_did_receive(&mut self, counter: u64) {
+        if counter >= self.next {
+            // Counter ahead — clear gap bits and advance
+            if counter - self.next >= REPLAY_N_BITS {
+                // Big gap: clear entire bitmap
+                for w in self.bitmap.iter_mut() {
+                    *w = 0;
+                }
+            } else {
+                // Small gap: clear intermediate words
+                let mut i = self.next;
+                while i % REPLAY_WORD_SIZE != 0 && i < counter {
+                    self.clear_bit(i);
+                    i += 1;
+                }
+                while i + REPLAY_WORD_SIZE <= counter {
+                    self.clear_word(i);
+                    i += REPLAY_WORD_SIZE;
+                }
+                while i <= counter {
+                    self.clear_bit(i);
+                    i += 1;
+                }
+            }
+            self.set_bit(counter);
+            self.next = counter + 1;
+        } else {
+            // counter < next: within window, not duplicate (already checked)
+            self.set_bit(counter);
+        }
+    }
+
+    // --- Bitmap helpers ---
+
+    #[inline(always)]
+    fn set_bit(&mut self, idx: u64) {
+        let bit_idx = idx % REPLAY_N_BITS;
+        let word = (bit_idx / REPLAY_WORD_SIZE) as usize;
+        let bit = (bit_idx % REPLAY_WORD_SIZE) as usize;
+        self.bitmap[word] |= 1 << bit;
+    }
+
+    #[inline(always)]
+    fn clear_bit(&mut self, idx: u64) {
+        let bit_idx = idx % REPLAY_N_BITS;
+        let word = (bit_idx / REPLAY_WORD_SIZE) as usize;
+        let bit = (bit_idx % REPLAY_WORD_SIZE) as usize;
+        self.bitmap[word] &= !(1u64 << bit);
+    }
+
+    #[inline(always)]
+    fn clear_word(&mut self, idx: u64) {
+        let bit_idx = idx % REPLAY_N_BITS;
+        let word = (bit_idx / REPLAY_WORD_SIZE) as usize;
+        self.bitmap[word] = 0;
+    }
+
+    #[inline(always)]
+    fn check_bit(&self, idx: u64) -> bool {
+        let bit_idx = idx % REPLAY_N_BITS;
+        let word = (bit_idx / REPLAY_WORD_SIZE) as usize;
+        let bit = (bit_idx % REPLAY_WORD_SIZE) as usize;
+        ((self.bitmap[word] >> bit) & 1) == 1
+    }
+}
+
+impl Default for ReplayValidator {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Validate that a nonce has not reached the reserved value.
@@ -504,5 +698,126 @@ mod tests {
         // Still decrypts correctly
         let pt2 = cs_recv.decrypt(&ct2).unwrap();
         assert_eq!(pt2, b"hello");
+    }
+
+    #[test]
+    fn encrypt_into_decrypt_into_roundtrip() {
+        let key = [0xAAu8; SYMMETRIC_KEY_LEN];
+        let nonce = [0x00u8; NONCE_LEN];
+        let plaintext = b"hello fengni zero-copy";
+
+        let mut ct_buf = vec![0u8; plaintext.len() + TAG_LEN];
+        let written = encrypt_into(&key, &nonce, plaintext, &mut ct_buf).unwrap();
+        assert_eq!(written, plaintext.len() + TAG_LEN);
+
+        let mut pt_buf = vec![0u8; plaintext.len()];
+        let read = decrypt_into(&key, &nonce, &ct_buf[..written], &mut pt_buf).unwrap();
+        assert_eq!(read, plaintext.len());
+        assert_eq!(&pt_buf[..read], plaintext);
+    }
+
+    #[test]
+    fn cipherstate_encrypt_into_decrypt_into_roundtrip() {
+        let key = [0xAAu8; SYMMETRIC_KEY_LEN];
+        let plaintext = b"zero-copy via cipherstate";
+        let mut cs_send = CipherState::new(&key);
+        let mut cs_recv = CipherState::new(&key);
+
+        let mut ct_buf = vec![0u8; plaintext.len() + TAG_LEN];
+        let written = cs_send.encrypt_into(plaintext, &mut ct_buf).unwrap();
+        assert_eq!(written, plaintext.len() + TAG_LEN);
+        assert_eq!(cs_send.nonce(), 1);
+
+        let mut pt_buf = vec![0u8; plaintext.len()];
+        let read = cs_recv.decrypt_into(&ct_buf[..written], &mut pt_buf).unwrap();
+        assert_eq!(read, plaintext.len());
+        assert_eq!(&pt_buf[..read], plaintext);
+        assert_eq!(cs_recv.nonce(), 1);
+    }
+
+    // --- ReplayValidator tests ---
+
+    #[test]
+    fn replay_validator_accepts_sequential() {
+        let mut r = ReplayValidator::new();
+        for i in 0..100 {
+            assert!(r.will_accept(i).is_ok(), "should accept {}", i);
+            r.mark_did_receive(i);
+        }
+    }
+
+    #[test]
+    fn replay_validator_rejects_duplicate() {
+        let mut r = ReplayValidator::new();
+        r.will_accept(0).unwrap();
+        r.mark_did_receive(0);
+        r.will_accept(1).unwrap();
+        r.mark_did_receive(1);
+
+        // Duplicate of 0 should be rejected
+        assert!(r.will_accept(0).is_err());
+        // Duplicate of 1 should be rejected
+        assert!(r.will_accept(1).is_err());
+    }
+
+    #[test]
+    fn replay_validator_rejects_too_old() {
+        let mut r = ReplayValidator::new();
+        // Advance past the window
+        for i in 0..REPLAY_N_BITS {
+            r.will_accept(i).unwrap();
+            r.mark_did_receive(i);
+        }
+        r.will_accept(REPLAY_N_BITS).unwrap();
+        r.mark_did_receive(REPLAY_N_BITS);
+
+        // Nonce 0 is now too old (1024 behind)
+        assert!(r.will_accept(0).is_err());
+    }
+
+    #[test]
+    fn replay_validator_accepts_out_of_order() {
+        let mut r = ReplayValidator::new();
+        // Receive 0, 1, 5, then 3 (out of order), then duplicate 3
+        r.will_accept(0).unwrap();
+        r.mark_did_receive(0);
+        r.will_accept(1).unwrap();
+        r.mark_did_receive(1);
+        r.will_accept(5).unwrap();
+        r.mark_did_receive(5);
+        // 3 is within window and not yet seen
+        r.will_accept(3).unwrap();
+        r.mark_did_receive(3);
+        // Now 3 is duplicate
+        assert!(r.will_accept(3).is_err());
+        // 5 is also duplicate
+        assert!(r.will_accept(5).is_err());
+    }
+
+    #[test]
+    fn replay_validator_large_gap_clears_window() {
+        let mut r = ReplayValidator::new();
+        r.will_accept(0).unwrap();
+        r.mark_did_receive(0);
+
+        // Jump far ahead (> window size)
+        let far = REPLAY_N_BITS * 3;
+        r.will_accept(far).unwrap();
+        r.mark_did_receive(far);
+
+        // Old values should be rejected
+        assert!(r.will_accept(0).is_err());
+        assert!(r.will_accept(far / 2).is_err());
+        // But immediate successor is fine
+        assert!(r.will_accept(far + 1).is_ok());
+    }
+
+    #[test]
+    fn aead_safety_limits() {
+        // ChaCha20-Poly1305 confidentiality limit with sequential nonces
+        // is effectively unlimited (nonce space is the limit).
+        assert_eq!(CipherState::confidentiality_limit(), u64::MAX);
+        // Integrity limit from RFC 9001 §6.6
+        assert_eq!(CipherState::integrity_limit(), 1 << 36);
     }
 }

@@ -35,6 +35,10 @@ pub enum CryptoError {
     #[error("decryption failed")]
     Decrypt,
 
+    /// A replayed nonce was detected.
+    #[error("nonce replayed — possible replay attack")]
+    NonceReplayed,
+
     /// Key derivation failed.
     #[error("key derivation failed")]
     KeyDerivation,

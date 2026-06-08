@@ -653,4 +653,73 @@ mod tests {
         let result = hs.into_transport();
         assert!(result.is_err());
     }
+
+    #[test]
+    fn transport_replay_rejects_duplicate() {
+        // Complete a handshake
+        let mut alice_key = KeyPair::generate();
+        let bob_key = KeyPair::generate();
+        let bob_pub = bob_key.public_key_bytes();
+        alice_key.pin_peer(&bob_pub);
+
+        let mut hs_a = HandshakeBuilder::initiator(alice_key, bob_pub).build();
+        let mut hs_b = HandshakeBuilder::responder(bob_key).build();
+
+        let hello = hs_a.send_hello().unwrap();
+        let reply = hs_b.handle_message(&hello).unwrap().unwrap();
+        let auth = hs_a.handle_message(&reply).unwrap().unwrap();
+        let _finish = hs_b.handle_message(&auth).unwrap().unwrap();
+        hs_a.handle_message(&_finish).unwrap();
+
+        let transport_a = hs_a.into_transport().unwrap();
+        let transport_b = hs_b.into_transport().unwrap();
+
+        // First message works
+        let ct = transport_a.send(b"msg 1").unwrap();
+        let pt = transport_b.recv(&ct).unwrap();
+        assert_eq!(pt, b"msg 1");
+
+        // Replaying the same ciphertext should fail (nonce already consumed)
+        let result = transport_b.recv(&ct);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn transport_auth_failures_increment() {
+        // Complete a handshake
+        let mut alice_key = KeyPair::generate();
+        let bob_key = KeyPair::generate();
+        let bob_pub = bob_key.public_key_bytes();
+        alice_key.pin_peer(&bob_pub);
+
+        let mut hs_a = HandshakeBuilder::initiator(alice_key, bob_pub).build();
+        let mut hs_b = HandshakeBuilder::responder(bob_key).build();
+
+        let hello = hs_a.send_hello().unwrap();
+        let reply = hs_b.handle_message(&hello).unwrap().unwrap();
+        let auth = hs_a.handle_message(&reply).unwrap().unwrap();
+        let finish = hs_b.handle_message(&auth).unwrap().unwrap();
+        hs_a.handle_message(&finish).unwrap();
+
+        let transport_a = hs_a.into_transport().unwrap();
+        let transport_b = hs_b.into_transport().unwrap();
+
+        // Send a valid message first
+        let ct = transport_a.send(b"valid").unwrap();
+        let _ = transport_b.recv(&ct).unwrap();
+
+        // Try to decrypt garbage — should fail and increment auth_failures
+        assert_eq!(transport_b.auth_failures(), 0);
+        let garbage = vec![0xCCu8; 32];
+        let result = transport_b.recv(&garbage);
+        assert!(result.is_err());
+        assert_eq!(transport_b.auth_failures(), 1);
+    }
+
+    #[test]
+    fn transport_integrity_limit_is_defined() {
+        // ChaCha20-Poly1305 integrity limit per RFC 9001 §6.6
+        assert_eq!(TransportState::integrity_limit(), 1 << 36);
+        assert_eq!(TransportState::confidentiality_limit(), u64::MAX);
+    }
 }
