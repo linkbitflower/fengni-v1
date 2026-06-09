@@ -358,7 +358,10 @@ impl CipherState {
         let mut nonce_bytes = [0u8; NONCE_LEN];
         nonce_bytes[4..12].copy_from_slice(&self.n.to_le_bytes());
         let ct = encrypt(&self.key, &nonce_bytes, plaintext)?;
-        self.n += 1;
+        self.n = self
+            .n
+            .checked_add(1)
+            .ok_or(CryptoError::NonceExhausted)?;
         Ok(ct)
     }
 
@@ -373,7 +376,10 @@ impl CipherState {
         let mut nonce_bytes = [0u8; NONCE_LEN];
         nonce_bytes[4..12].copy_from_slice(&self.n.to_le_bytes());
         let pt = decrypt(&self.key, &nonce_bytes, ciphertext)?;
-        self.n += 1;
+        self.n = self
+            .n
+            .checked_add(1)
+            .ok_or(CryptoError::NonceExhausted)?;
         Ok(pt)
     }
 
@@ -389,7 +395,10 @@ impl CipherState {
         let mut nonce_bytes = [0u8; NONCE_LEN];
         nonce_bytes[4..12].copy_from_slice(&self.n.to_le_bytes());
         let written = encrypt_into(&self.key, &nonce_bytes, plaintext, out)?;
-        self.n += 1;
+        self.n = self
+            .n
+            .checked_add(1)
+            .ok_or(CryptoError::NonceExhausted)?;
         Ok(written)
     }
 
@@ -405,7 +414,10 @@ impl CipherState {
         let mut nonce_bytes = [0u8; NONCE_LEN];
         nonce_bytes[4..12].copy_from_slice(&self.n.to_le_bytes());
         let written = decrypt_into(&self.key, &nonce_bytes, ciphertext, out)?;
-        self.n += 1;
+        self.n = self
+            .n
+            .checked_add(1)
+            .ok_or(CryptoError::NonceExhausted)?;
         Ok(written)
     }
 
@@ -592,7 +604,7 @@ impl ReplayValidator {
                 }
             }
             self.set_bit(counter);
-            self.next = counter + 1;
+            self.next = counter.saturating_add(1);
         } else {
             // counter < next: within window, not duplicate (already checked)
             self.set_bit(counter);

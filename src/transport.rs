@@ -219,6 +219,16 @@ impl TransportState {
     /// Decrypt with an explicit nonce (does not consume `&mut self` internal counter).
     ///
     /// Includes replay protection against the provided nonce.
+    ///
+    /// ## Concurrent callers
+    ///
+    /// The replay window is shared across all `recv*` methods on the same
+    /// `TransportState`. When multiple threads call `recv_with_nonce` with
+    /// non-overlapping nonce ranges, a thread that marks a high nonce advances
+    /// the window past lower nonces from other threads. This is by design —
+    /// the window enforces anti-replay at the transport level, not per-thread.
+    /// Callers coordinating across threads should partition the nonce space so
+    /// that replay ordering is maintained.
     pub fn recv_with_nonce(&self, nonce: u64, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
         self.replay.lock().unwrap().will_accept(nonce)?;
         match self.recv.lock().unwrap().decrypt_with_nonce(nonce, ciphertext) {
@@ -236,6 +246,10 @@ impl TransportState {
     /// Zero-copy decrypt with an explicit nonce.
     ///
     /// Includes replay protection against the provided nonce.
+    ///
+    /// ## Concurrent callers
+    ///
+    /// Same replay-window behavior as [`recv_with_nonce`](Self::recv_with_nonce).
     pub fn recv_into_with_nonce(
         &self,
         nonce: u64,
